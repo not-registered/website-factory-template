@@ -1,0 +1,113 @@
+name: Container CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-test-publish:
+    if: github.repository != 'not-registered/website-factory-template'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SLUG="${GITHUB_REPOSITORY#*/}"
+          SLUG_UPPER="$(printf '%s' "${SLUG}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+          MARKER="GOKON-${SLUG_UPPER}-STAGING-OK"
+
+          echo "image=${IMAGE}"
+          echo "marker=${MARKER}"
+
+          docker build \
+            --pull \
+            --build-arg "PROJECT_MARKER=${MARKER}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMAGE}:test-${GITHUB_SHA}" \
+            .
+
+      - name: Runtime smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SLUG="${GITHUB_REPOSITORY#*/}"
+          SLUG_UPPER="$(printf '%s' "${SLUG}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+          MARKER="GOKON-${SLUG_UPPER}-STAGING-OK"
+          NAME="website-factory-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "${NAME}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d \
+            --name "${NAME}" \
+            -p 127.0.0.1:18080:8080 \
+            "${IMAGE}:test-${GITHUB_SHA}"
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18080/ | grep -Fq "${MARKER}"; then
+              echo "runtime_smoke=PASS"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs "${NAME}"
+          exit 1
+
+      - name: Login to GHCR
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" |
+            docker login ghcr.io \
+              --username "${GITHUB_ACTOR}" \
+              --password-stdin
+
+      - name: Publish immutable SHA and staging tags
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHA_TAG="sha-${GITHUB_SHA}"
+
+          docker tag "${IMAGE}:test-${GITHUB_SHA}" "${IMAGE}:${SHA_TAG}"
+          docker tag "${IMAGE}:test-${GITHUB_SHA}" "${IMAGE}:staging"
+
+          docker push "${IMAGE}:${SHA_TAG}"
+          docker push "${IMAGE}:staging"
+
+      - name: Verify published staging tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker manifest inspect "${IMAGE}:staging" >/dev/null
+          echo "published_staging_manifest=PASS"
